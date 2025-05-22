@@ -1,0 +1,221 @@
+name: Build and Test
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches:
+      - '**'
+
+jobs:
+  lint:
+    runs-on: macos-15
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install SwiftLint
+      run: brew install swiftlint
+
+    - name: Run SwiftLint
+      run: swiftlint lint --strict
+
+    - name: Set up Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+        components: rustfmt, clippy
+
+    - name: Check Rust formatting
+      run: cargo fmt --all -- --check
+      working-directory: dicom-parser
+
+    - name: Run Clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings
+      working-directory: dicom-parser
+
+  build:
+    # needs: lint
+    runs-on: macos-15
+    environment: ${{ github.ref == 'refs/heads/main' && 'signer' || '' }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Select Xcode 16.3
+      run: sudo xcode-select -s /Applications/Xcode_16.3.app
+
+    - name: Set up Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+        components: rustfmt, clippy
+
+    - name: Install Rust targets
+      run: |
+        rustup target add x86_64-apple-darwin
+        rustup target add aarch64-apple-darwin
+
+    - name: Cache Rust
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          ~/.rustup/toolchains/
+          dicom-parser/target
+        key: rust-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          rust-${{ runner.os }}-
+
+    - name: Install Certificates and Provisioning Profile
+      if: github.ref == 'refs/heads/main'
+      run: |
+        KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+        CERT_PATH=$RUNNER_TEMP/developer_id.pem
+        KEY_PATH=$RUNNER_TEMP/developer_id.key
+        P12_PATH=$RUNNER_TEMP/developer_id.p12
+        PROFILE_PATH=$RUNNER_TEMP/DicomPreview.provisionprofile
+        
+        security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+        security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+        security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+        
+        # Make our keychain the default and only one in the search list
+        security default-keychain -s $KEYCHAIN_PATH
+        
+        # Decode certificate and key from base64
+        echo -n "$DEVELOPER_ID_CERT" | base64 --decode > $CERT_PATH
+        echo -n "$DEVELOPER_ID_KEY" | base64 --decode > $KEY_PATH
+        
+        # Convert PEM to P12
+        openssl pkcs12 -export \
+          -inkey $KEY_PATH \
+          -in $CERT_PATH \
+          -out $P12_PATH \
+          -passout pass:"$KEYCHAIN_PASSWORD"
+        
+        # Import into keychain with proper settings
+        security import $P12_PATH -P "$KEYCHAIN_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+        security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+        
+        # Install provisioning profile
+        echo -n "$PROVISIONING_PROFILE" | base64 --decode > $PROFILE_PATH
+        mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+        cp $PROFILE_PATH ~/Library/MobileDevice/Provisioning\ Profiles/
+        
+        # Clean up sensitive files
+        rm $CERT_PATH $KEY_PATH $P12_PATH $PROFILE_PATH
+      env:
+        DEVELOPER_ID_CERT: ${{ secrets.DEVELOPER_ID_CERT }}
+        DEVELOPER_ID_KEY: ${{ secrets.DEVELOPER_ID_KEY }}
+        KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        PROVISIONING_PROFILE: ${{ secrets.PROVISIONING_PROFILE }}
+
+    - name: Build Rust library
+      run: |
+        chmod +x build_rust_library.sh
+        ./build_rust_library.sh
+
+    - name: Prepare Export Options
+      if: github.ref == 'refs/heads/main'
+      run: |
+        envsubst < ExportOptions.plist > ExportOptions.tmp.plist
+        mv ExportOptions.tmp.plist ExportOptions.plist
+      env:
+        TEAM_ID: ${{ secrets.TEAM_ID }}
+
+    - name: Build and Archive Xcode project
+      # For non-main branches, we disable code signing to allow builds to complete
+      # without requiring provisioning profiles
+      run: |
+        if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+          xcodebuild archive \
+            -project DicomPreview.xcodeproj \
+            -scheme DicomPreview \
+            -archivePath build/DicomPreview.xcarchive \
+            -destination 'generic/platform=macOS'
+        else
+          xcodebuild archive \
+            -project DicomPreview.xcodeproj \
+            -scheme DicomPreview \
+            -archivePath build/DicomPreview.xcarchive \
+            -destination 'generic/platform=macOS' \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+        fi
+
+    - name: Export Archive
+      if: github.ref == 'refs/heads/main'
+      run: |
+        xcodebuild \
+          -exportArchive \
+          -archivePath build/DicomPreview.xcarchive \
+          -exportOptionsPlist ExportOptions.plist \
+          -exportPath build/Export \
+          -allowProvisioningUpdates
+
+    - name: Create DMG
+      if: github.ref == 'refs/heads/main'
+      run: |
+        npx --yes create-dmg \
+          --overwrite \
+          build/Export/DicomPreview.app \
+          build/
+        mv build/DicomPreview*.dmg build/DicomPreview.dmg
+
+    - name: Prepare API Key for Notarization
+      if: github.ref == 'refs/heads/main'
+      run: |
+        API_KEY_PATH=$RUNNER_TEMP/api_key.p8
+        echo -n "$API_AUTH_KEY" | base64 --decode > $API_KEY_PATH
+        chmod 600 $API_KEY_PATH
+        echo "API_KEY_PATH=$API_KEY_PATH" >> $GITHUB_ENV
+      env:
+        API_AUTH_KEY: ${{ secrets.API_AUTH_KEY }}
+
+    - name: Notarize DMG
+      if: github.ref == 'refs/heads/main'
+      run: |
+        # Submit DMG for notarization and capture output
+        NOTARIZATION_OUTPUT=$(xcrun notarytool submit \
+          --key "$API_KEY_PATH" \
+          --key-id "$API_KEY_ID" \
+          --issuer "$API_ISSUER_ID" \
+          --wait \
+          build/DicomPreview.dmg)
+          
+        echo "$NOTARIZATION_OUTPUT"
+        
+        # Check if notarization was successful
+        if echo "$NOTARIZATION_OUTPUT" | grep -q "status: Accepted"; then
+          echo "Notarization successful. Stapling the DMG..."
+          xcrun stapler staple build/DicomPreview.dmg
+          if [ $? -ne 0 ]; then
+            echo "Warning: Stapling failed, but continuing with the workflow."
+          fi
+        else
+          # Extract submission ID for logs
+          SUBMISSION_ID=$(echo "$NOTARIZATION_OUTPUT" | grep -oE "id: [a-f0-9-]+" | head -1 | cut -d ' ' -f 2)
+          if [ -n "$SUBMISSION_ID" ]; then
+            echo "Retrieving notarization log for submission ID: $SUBMISSION_ID"
+            xcrun notarytool log --key "$API_KEY_PATH" --key-id "$API_KEY_ID" --issuer "$API_ISSUER_ID" "$SUBMISSION_ID"
+          fi
+          echo "::error::Notarization failed. See log output above for details."
+          exit 1
+        fi
+      env:
+        API_KEY_ID: ${{ secrets.API_KEY_ID }}
+        API_ISSUER_ID: ${{ secrets.API_ISSUER_ID }}
+
+    - name: Upload artifact
+      if: github.ref == 'refs/heads/main'
+      uses: actions/upload-artifact@v4
+      with:
+        name: DicomPreview${{ github.ref == 'refs/heads/main' && '-signed' || '' }}
+        path: build/DicomPreview.dmg

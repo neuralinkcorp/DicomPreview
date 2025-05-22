@@ -1,0 +1,30 @@
+repos:
+- repo: https://github.com/realm/SwiftLint
+  rev: 0.54.0
+  hooks:
+    - id: swiftlint
+      entry: swiftlint --strict
+      types: [file, swift]
+
+- repo: local
+  hooks:
+    - id: cargo-fmt
+      name: Rust formatting
+      entry: bash -c 'cd dicom-parser && cargo fmt --all -- --check'
+      language: system
+      types: [rust]
+      pass_filenames: false
+
+    - id: cargo-clippy
+      name: Rust linting
+      entry: bash -c 'cd dicom-parser && cargo clippy --all-targets --all-features -- -D warnings'
+      language: system
+      types: [rust]
+      pass_filenames: false
+
+    - id: cargo-test
+      name: Rust tests
+      entry: bash -c 'cd dicom-parser && cargo test --all'
+      language: system
+      types: [rust]
+      pass_filenames: false 

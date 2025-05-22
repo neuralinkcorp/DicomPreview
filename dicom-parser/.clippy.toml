@@ -1,0 +1,7 @@
+cognitive-complexity-threshold = 25
+too-many-arguments-threshold = 7
+type-complexity-threshold = 250
+enum-variant-size-threshold = 200
+
+# Enable additional clippy lints
+warn-on-all-wildcard-imports = true 
