@@ -1,0 +1,24 @@
+[package]
+name = "dicom-parser"
+version = "0.1.0"
+edition = "2021"
+authors = ["Neuralink Corp"]
+description = "DICOM parser library for DicomPreview"
+license = "MIT"
+
+[lib]
+name = "dicom_parser"
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+base64 = "0.22.1"
+dicom = { version = "0.8.0", features = ["default"] }
+dicom-dictionary-std = "0.8.0"
+dicom-pixeldata = { version = "0.8.1", features = ["image", "native", "jpeg"] }
+image = "0.25.6"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cc = "1.0" 
